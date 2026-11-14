@@ -10,7 +10,7 @@ const {
     entersState, VoiceConnectionStatus, AudioPlayerStatus, getVoiceConnection,
     generateDependencyReport, StreamType 
 } = require('@discordjs/voice');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 
 const client = new Client({
     intents: [
@@ -31,7 +31,8 @@ const CHANNEL_LIVES = '1447400943061700759';
 const CATEGORIA_TICKETS = '1412972614694998097';
 const CHANNEL_LOGS_REGISTROS = '1570976488541528114'; // logs do set/registro
 const CHANNEL_LOGS_TICKETS = '1571032220058128394'; // logs de tickets finalizados
-const CHANNEL_WELCOME = '1412972674107310191'; // Ajuste o ID se preferir outro canal para entrada/saída
+const CHANNEL_WELCOME = '1412972654805127178'; // boas-vindas de quem entra
+const CHANNEL_SAIDA = '1412972656072065156'; // mensagem de quem sai
 
 // IDs DE CARGOS DO SET
 const CARGOS = {
@@ -64,16 +65,16 @@ client.on('guildMemberAdd', async member => {
         .setTimestamp()
         .setFooter({ text: `ID do Usuário: ${member.id}` });
 
-    await channel.send({ embeds: [embed] });
+    await channel.send({ content: `👋 Bem-vindo ao canal, ${member}!`, embeds: [embed] });
 });
 
 client.on('guildMemberRemove', async member => {
-    const channel = member.guild.channels.cache.get(CHANNEL_WELCOME);
+    const channel = member.guild.channels.cache.get(CHANNEL_SAIDA);
     if (!channel) return;
 
     const embed = new EmbedBuilder()
         .setTitle('🚪 Membro Saiu')
-        .setDescription(`O membro **${member.user.tag}** deixou o servidor.`)
+        .setDescription(`**${member.user.tag}** saiu do servidor.\n\n🙏 **Vai com DEUS!**`)
         .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 512 }))
         .setColor(0xE74C3C)
         .setTimestamp();
@@ -82,99 +83,324 @@ client.on('guildMemberRemove', async member => {
 });
 
 // ==========================================
-// 2. MÚSICA NA CALL
+// 2. MÚSICA NA CALL (fila, pular, pausa)
 // ==========================================
+const musicas = new Map(); // guildId -> estado da música do servidor
+const LIMITE_FILA = 50;
+const TEMPO_INATIVO_MS = 2 * 60 * 1000; // sai da call 2 min depois que a fila acaba
+
+function argsCookies() {
+    return process.env.YTDLP_COOKIES ? ['--cookies', process.env.YTDLP_COOKIES] : [];
+}
+
+function encurtar(texto, max = 80) {
+    return texto.length > max ? texto.slice(0, max - 1) + '…' : texto;
+}
+
+function textoDuracao(track) {
+    return track.duracao ? ` \`[${track.duracao}]\`` : '';
+}
+
+// Busca título, link final e duração (aceita link ou nome da música)
+function obterInfoMusica(query) {
+    const alvo = /^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`;
+    const args = [
+        '--no-playlist', '--no-warnings', '--js-runtimes', 'node',
+        '--print', '%(title)s', '--print', '%(webpage_url)s', '--print', '%(duration_string)s',
+        ...argsCookies(), alvo
+    ];
+
+    return new Promise((resolve, reject) => {
+        execFile('yt-dlp', args, { timeout: 45_000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+            const linhas = String(stdout).trim().split('\n').filter(Boolean);
+            if (err || linhas.length < 2) {
+                const motivo = String(stderr || '').trim().split('\n').pop().slice(0, 300)
+                    || (err ? err.message : '') || 'Nenhum resultado encontrado';
+                return reject(new Error(motivo));
+            }
+            resolve({
+                titulo: linhas[0],
+                url: linhas[1],
+                duracao: linhas[2] && linhas[2] !== 'NA' ? linhas[2] : null
+            });
+        });
+    });
+}
+
+function matarProc(proc) {
+    if (!proc) return;
+    proc.cancelado = true;
+    try { proc.kill(); } catch {}
+}
+
+// Limpa o estado do servidor (sem mexer na conexão de voz)
+function limparMusica(state) {
+    if (state.destruido) return;
+    state.destruido = true;
+    clearTimeout(state.timeoutSaida);
+    state.fila = [];
+    state.atual = null;
+    matarProc(state.proc);
+    try { state.player.stop(true); } catch {}
+    musicas.delete(state.guildId);
+}
+
+// Limpa tudo e sai da call
+function sairDaCall(state) {
+    limparMusica(state);
+    if (state.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        state.connection.destroy();
+    }
+}
+
+// Toca a próxima música da fila (ou agenda a saída se a fila acabou)
+function tocarProxima(state) {
+    if (state.destruido) return;
+
+    const track = state.fila.shift();
+    if (!track) {
+        state.atual = null;
+        state.proc = null;
+        clearTimeout(state.timeoutSaida);
+        state.timeoutSaida = setTimeout(() => {
+            state.canal.send('👋 Fila vazia, saindo do canal de voz.').catch(() => {});
+            sairDaCall(state);
+        }, TEMPO_INATIVO_MS);
+        return;
+    }
+
+    clearTimeout(state.timeoutSaida);
+    state.atual = track;
+
+    const ytArgs = [
+        '-f', 'bestaudio/best', '--no-playlist', '--js-runtimes', 'node',
+        '-q', '--no-warnings', '-o', '-',
+        ...argsCookies(), track.url
+    ];
+    console.log('[música] tocando:', track.titulo, '|', track.url);
+
+    const proc = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+    state.proc = proc;
+
+    let erroTexto = '';
+    let recebeuDados = false;
+    proc.stderr.on('data', d => { erroTexto += d.toString(); });
+    proc.stdout.on('error', () => {});
+    proc.stdout.once('data', () => { recebeuDados = true; console.log('[música] áudio começou a chegar'); });
+    proc.on('error', err => {
+        console.error('[yt-dlp] não iniciou:', err);
+        state.canal.send('❌ O yt-dlp não está instalado no servidor.').catch(() => {});
+    });
+    proc.on('close', code => {
+        if (proc.cancelado) return;
+        if (code !== 0 && !recebeuDados) {
+            console.error('[yt-dlp] falhou:', erroTexto);
+            const ultimaLinha = erroTexto.trim().split('\n').pop().slice(0, 300);
+            state.canal.send(`❌ Não consegui tocar **${encurtar(track.titulo)}**: \`${ultimaLinha || 'erro desconhecido'}\``).catch(() => {});
+        }
+    });
+
+    const resource = createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary });
+    state.player.play(resource);
+
+    state.canal.send(`🎶 Tocando agora: **${encurtar(track.titulo)}**${textoDuracao(track)} — pedido por ${track.pedidoPor}`).catch(() => {});
+}
+
+// Cria (ou reaproveita) a conexão de voz, o player e a fila do servidor
+function obterOuCriarEstado(message, canalVoz) {
+    let state = musicas.get(message.guild.id);
+    if (state) return state;
+
+    const connection = joinVoiceChannel({
+        channelId: canalVoz.id,
+        guildId: canalVoz.guild.id,
+        adapterCreator: canalVoz.guild.voiceAdapterCreator,
+        selfDeaf: true
+    });
+    const player = createAudioPlayer();
+
+    state = {
+        guildId: message.guild.id,
+        channelId: canalVoz.id,
+        connection,
+        player,
+        fila: [],
+        atual: null,
+        proc: null,
+        canal: message.channel,
+        timeoutSaida: null,
+        destruido: false
+    };
+
+    connection.on('stateChange', (antigo, novo) => console.log(`[voz] ${antigo.status} -> ${novo.status}`));
+    connection.on('error', err => console.error('[voz] erro na conexão:', err));
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+            await Promise.race([
+                entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+                entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+            ]);
+        } catch {
+            sairDaCall(state); // foi desconectado de vez (ex.: kickado da call)
+        }
+    });
+    connection.on(VoiceConnectionStatus.Destroyed, () => limparMusica(state));
+
+    player.on('stateChange', (antigo, novo) => console.log(`[player] ${antigo.status} -> ${novo.status}`));
+    player.on('error', err => console.error('Erro no player:', err));
+    player.on(AudioPlayerStatus.Idle, () => {
+        if (state.destruido) return;
+        matarProc(state.proc);
+        tocarProxima(state); // música acabou ou foi pulada
+    });
+
+    connection.subscribe(player);
+    musicas.set(state.guildId, state);
+    return state;
+}
+
+// Para pular/pausar/continuar: precisa ter música e estar na mesma call do bot
+function estadoParaControle(message) {
+    const state = musicas.get(message.guild.id);
+    if (!state || !state.atual) {
+        message.reply('❌ Não há nenhuma música tocando no momento.');
+        return null;
+    }
+    const canalVoz = message.member.voice.channel;
+    if (!canalVoz || canalVoz.id !== state.channelId) {
+        message.reply('❌ Você precisa estar no mesmo canal de voz que o bot.');
+        return null;
+    }
+    return state;
+}
+
 client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild) return;
 
-    if (message.content.startsWith('!play')) {
-        const args = message.content.trim().split(/ +/);
-        args.shift();
-        const query = args.join(' ');
+    const [comando, ...resto] = message.content.trim().split(/ +/);
+    const cmd = comando.toLowerCase();
 
-        if (!message.member.voice.channel) {
+    // ▶️ !play <link ou nome> -> toca ou adiciona na fila
+    if (cmd === '!play') {
+        const query = resto.join(' ');
+        const canalVoz = message.member.voice.channel;
+
+        if (!canalVoz) {
             return message.reply('❌ Você precisa estar em um canal de voz para tocar música!');
         }
-
         if (!query) {
             return message.reply('❌ Digite o link ou o nome da música após o comando. Ex: `!play <link ou nome>`');
         }
 
-        const voiceChannel = message.member.voice.channel;
-        const connection = joinVoiceChannel({
-            channelId: voiceChannel.id,
-            guildId: voiceChannel.guild.id,
-            adapterCreator: voiceChannel.guild.voiceAdapterCreator,
-            selfDeaf: true
-        });
+        const existente = musicas.get(message.guild.id);
+        if (existente && existente.channelId !== canalVoz.id) {
+            return message.reply('❌ O bot já está tocando em outro canal de voz.');
+        }
+        if (existente && existente.fila.length >= LIMITE_FILA) {
+            return message.reply(`❌ A fila está cheia (máximo de ${LIMITE_FILA} músicas).`);
+        }
 
-        connection.on('stateChange', (antigo, novo) => console.log(`[voz] ${antigo.status} -> ${novo.status}`));
-        connection.on('error', err => console.error('[voz] erro na conexão:', err));
+        const aviso = await message.reply('🔎 Buscando...');
+
+        let info;
+        try {
+            info = await obterInfoMusica(query);
+        } catch (error) {
+            console.error('[yt-dlp] erro ao buscar info:', error.message);
+            return aviso.edit(`❌ Não consegui encontrar essa música: \`${error.message}\``);
+        }
+
+        const state = obterOuCriarEstado(message, canalVoz);
+        if (state.channelId !== canalVoz.id) {
+            return aviso.edit('❌ O bot já está tocando em outro canal de voz.');
+        }
+        state.canal = message.channel;
 
         try {
-            // Espera a conexão de voz ficar pronta antes de tocar
-            await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-
-            // Link vai direto; texto vira busca no YouTube (primeiro resultado)
-            const alvo = /^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`;
-            console.log('[música] yt-dlp alvo:', alvo);
-
-            const ytArgs = ['-f', 'bestaudio/best', '--no-playlist', '--js-runtimes', 'node', '-q', '--no-warnings', '-o', '-'];
-            if (process.env.YTDLP_COOKIES) ytArgs.push('--cookies', process.env.YTDLP_COOKIES); // opcional
-            ytArgs.push(alvo);
-
-            const proc = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
-            let erroTexto = '';
-            let recebeuDados = false;
-            let avisou = false;
-            const avisarErro = texto => {
-                if (avisou) return;
-                avisou = true;
-                connection.destroy();
-                message.channel.send(texto).catch(() => {});
-            };
-
-            proc.stderr.on('data', d => { erroTexto += d.toString(); });
-            proc.stdout.once('data', () => { recebeuDados = true; console.log('[música] áudio começou a chegar'); });
-            proc.on('error', err => {
-                console.error('[yt-dlp] não iniciou:', err);
-                avisarErro('❌ O yt-dlp não está instalado no servidor.');
-            });
-            proc.on('close', code => {
-                if (code !== 0 && !recebeuDados) {
-                    console.error('[yt-dlp] falhou:', erroTexto);
-                    const ultimaLinha = erroTexto.trim().split('\n').pop().slice(0, 300);
-                    avisarErro(`❌ Não consegui obter o áudio: \`${ultimaLinha || 'erro desconhecido'}\``);
-                }
-            });
-
-            const resource = createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary });
-            const player = createAudioPlayer();
-
-            player.on('stateChange', (antigo, novo) => console.log(`[player] ${antigo.status} -> ${novo.status}`));
-            player.on('error', err => {
-                console.error('Erro no player:', err);
-                message.channel.send('❌ Erro durante a reprodução.');
-            });
-
-            // Quando terminar, encerra o yt-dlp e sai da call
-            player.on(AudioPlayerStatus.Idle, () => {
-                proc.kill();
-                connection.destroy();
-            });
-
-            connection.subscribe(player);
-            player.play(resource);
-
-            message.reply('🎶 Buscando e tocando sua música...');
+            await entersState(state.connection, VoiceConnectionStatus.Ready, 30_000);
         } catch (error) {
-            console.error('Erro detalhado no player:', error);
-            connection.destroy();
-            message.reply(`❌ Erro ao reproduzir: \`${String(error.message).slice(0, 200)}\``);
+            console.error('Erro ao conectar na call:', error);
+            sairDaCall(state);
+            return aviso.edit('❌ Não consegui conectar ao canal de voz.');
+        }
+
+        const track = { ...info, pedidoPor: message.author.toString() };
+        state.fila.push(track);
+
+        if (!state.atual) {
+            tocarProxima(state);
+            aviso.delete().catch(() => {}); // o "Tocando agora" já avisa
+        } else {
+            aviso.edit(`➕ Adicionada à fila (posição ${state.fila.length}): **${encurtar(track.titulo)}**${textoDuracao(track)}`);
         }
     }
 
-    if (message.content === '!leave') {
+    // ⏭️ !pular
+    if (cmd === '!pular') {
+        const state = estadoParaControle(message);
+        if (!state) return;
+        const pulada = state.atual;
+        state.player.stop(true); // dispara o Idle e toca a próxima
+        message.reply(`⏭️ Pulando **${encurtar(pulada.titulo)}**`);
+    }
+
+    // ⏸️ !pausa
+    if (cmd === '!pausa') {
+        const state = estadoParaControle(message);
+        if (!state) return;
+        if (state.player.state.status === AudioPlayerStatus.Paused) {
+            return message.reply('⏸️ A música já está pausada. Use `!continuar` para retomar.');
+        }
+        state.player.pause();
+        message.reply('⏸️ Música pausada. Use `!continuar` para retomar.');
+    }
+
+    // ▶️ !continuar
+    if (cmd === '!continuar') {
+        const state = estadoParaControle(message);
+        if (!state) return;
+        if (state.player.state.status !== AudioPlayerStatus.Paused) {
+            return message.reply('▶️ A música não está pausada.');
+        }
+        state.player.unpause();
+        message.reply('▶️ Música retomada!');
+    }
+
+    // 📜 !fila
+    if (cmd === '!fila') {
+        const state = musicas.get(message.guild.id);
+        if (!state || (!state.atual && state.fila.length === 0)) {
+            return message.reply('📭 A fila está vazia.');
+        }
+
+        const pausada = state.player.state.status === AudioPlayerStatus.Paused ? ' ⏸️ (pausada)' : '';
+        const linhas = [];
+        if (state.atual) {
+            linhas.push(`🎶 **Tocando agora:**${pausada}\n${encurtar(state.atual.titulo)}${textoDuracao(state.atual)} — ${state.atual.pedidoPor}`);
+        }
+        if (state.fila.length) {
+            const proximas = state.fila.slice(0, 10)
+                .map((t, i) => `**${i + 1}.** ${encurtar(t.titulo)}${textoDuracao(t)}`);
+            linhas.push(`\n**Próximas (${state.fila.length}):**\n${proximas.join('\n')}`);
+            if (state.fila.length > 10) linhas.push(`…e mais ${state.fila.length - 10} música(s).`);
+        } else {
+            linhas.push('\nNenhuma música na fila.');
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle('📜 Fila de músicas')
+            .setDescription(linhas.join('\n'))
+            .setColor(0x1DB954);
+        message.reply({ embeds: [embed] });
+    }
+
+    // ⏹️ !leave -> limpa a fila e sai da call
+    if (cmd === '!leave') {
+        const state = musicas.get(message.guild.id);
+        if (state) {
+            sairDaCall(state);
+            return message.reply('⏹️ Fila limpa e desconectado do canal de voz.');
+        }
         const connection = getVoiceConnection(message.guild.id);
         if (connection) {
             connection.destroy();
