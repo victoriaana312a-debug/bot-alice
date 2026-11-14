@@ -8,9 +8,9 @@ const {
 const { 
     joinVoiceChannel, createAudioPlayer, createAudioResource,
     entersState, VoiceConnectionStatus, AudioPlayerStatus, getVoiceConnection,
-    generateDependencyReport 
+    generateDependencyReport, StreamType 
 } = require('@discordjs/voice');
-const playdl = require('play-dl');
+const { spawn } = require('child_process');
 
 const client = new Client({
     intents: [
@@ -115,21 +115,40 @@ client.on('messageCreate', async message => {
             // Espera a conexão de voz ficar pronta antes de tocar
             await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
 
-            // Se não for link, busca no YouTube pelo nome
-            let url = query;
-            if (!/^https?:\/\//i.test(query)) {
-                const results = await playdl.search(query, { limit: 1, source: { youtube: 'video' } });
-                if (!results.length) {
-                    connection.destroy();
-                    return message.reply('❌ Nenhum resultado encontrado.');
-                }
-                url = results[0].url;
-            }
+            // Link vai direto; texto vira busca no YouTube (primeiro resultado)
+            const alvo = /^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`;
+            console.log('[música] yt-dlp alvo:', alvo);
 
-            console.log('[música] buscando stream de:', url);
-            const streamData = await playdl.stream(url);
-            console.log('[música] stream obtido, tipo:', streamData.type);
-            const resource = createAudioResource(streamData.stream, { inputType: streamData.type });
+            const ytArgs = ['-f', 'bestaudio/best', '--no-playlist', '--js-runtimes', 'node', '-q', '--no-warnings', '-o', '-'];
+            if (process.env.YTDLP_COOKIES) ytArgs.push('--cookies', process.env.YTDLP_COOKIES); // opcional
+            ytArgs.push(alvo);
+
+            const proc = spawn('yt-dlp', ytArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+            let erroTexto = '';
+            let recebeuDados = false;
+            let avisou = false;
+            const avisarErro = texto => {
+                if (avisou) return;
+                avisou = true;
+                connection.destroy();
+                message.channel.send(texto).catch(() => {});
+            };
+
+            proc.stderr.on('data', d => { erroTexto += d.toString(); });
+            proc.stdout.once('data', () => { recebeuDados = true; console.log('[música] áudio começou a chegar'); });
+            proc.on('error', err => {
+                console.error('[yt-dlp] não iniciou:', err);
+                avisarErro('❌ O yt-dlp não está instalado no servidor.');
+            });
+            proc.on('close', code => {
+                if (code !== 0 && !recebeuDados) {
+                    console.error('[yt-dlp] falhou:', erroTexto);
+                    const ultimaLinha = erroTexto.trim().split('\n').pop().slice(0, 300);
+                    avisarErro(`❌ Não consegui obter o áudio: \`${ultimaLinha || 'erro desconhecido'}\``);
+                }
+            });
+
+            const resource = createAudioResource(proc.stdout, { inputType: StreamType.Arbitrary });
             const player = createAudioPlayer();
 
             player.on('stateChange', (antigo, novo) => console.log(`[player] ${antigo.status} -> ${novo.status}`));
@@ -138,15 +157,16 @@ client.on('messageCreate', async message => {
                 message.channel.send('❌ Erro durante a reprodução.');
             });
 
-            // Desconecta quando a música terminar
+            // Quando terminar, encerra o yt-dlp e sai da call
             player.on(AudioPlayerStatus.Idle, () => {
+                proc.kill();
                 connection.destroy();
             });
 
             connection.subscribe(player);
             player.play(resource);
 
-            message.reply('🎶 Tocando agora!');
+            message.reply('🎶 Buscando e tocando sua música...');
         } catch (error) {
             console.error('Erro detalhado no player:', error);
             connection.destroy();
