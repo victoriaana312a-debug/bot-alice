@@ -18,8 +18,8 @@ const client = new Client({
     partials: [Partials.Channel, Partials.Message]
 });
 
-// CONFIGURAÇÕES DO BOT
-const TOKEN = 'MTU3MDk2Mjk0NzI2NDQ4NzQ1NA.GZ84-6.zTutCh6lW-uhNK4MCZlrdvChNyF4ULEqfIQYSI';
+// CONFIGURAÇÕES DO BOT (Lendo o token com segurança pelo Railway)
+const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_AVISOS = '1412972674107310191';
 const CHANNEL_LIVES = '1447400943061700759';
 const CATEGORIA_TICKETS = '1447402685933334548';
@@ -87,7 +87,6 @@ client.on('messageCreate', async message => {
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
-    // Comando para o painel antigo (Ausência, etc)
     if (message.content.startsWith('!painel-registros')) {
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return message.reply('❌ Você não tem permissão para usar este comando.');
@@ -110,7 +109,6 @@ client.on('messageCreate', async message => {
         }
     }
 
-    // ⭐ NOVO: Comando para enviar o Painel Separado de Pedir Set (!painel-set)
     if (message.content.startsWith('!painel-set')) {
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return message.reply('❌ Você não tem permissão para usar este comando.');
@@ -136,7 +134,6 @@ client.on('messageCreate', async message => {
 
 client.on('interactionCreate', async interaction => {
     if (interaction.isButton()) {
-        // Abre o formulário específico de Pedir Set com as 4 perguntas
         if (interaction.customId === 'btn_pedir_set') {
             const modal = new ModalBuilder()
                 .setCustomId('modal_pedir_set')
@@ -195,7 +192,6 @@ client.on('interactionCreate', async interaction => {
     if (interaction.isModalSubmit()) {
         const logsChannel = interaction.guild.channels.cache.get(CHANNEL_LOGS_REGISTROS);
 
-        // Resposta do Formulário de Pedir Set
         if (interaction.customId === 'modal_pedir_set') {
             const nome = interaction.fields.getTextInputValue('input_nome');
             const idade = interaction.fields.getTextInputValue('input_idade');
@@ -220,7 +216,6 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        // Resposta do Formulário de Ausência
         if (interaction.customId === 'modal_ausencia') {
             const motivo = interaction.fields.getTextInputValue('input_motivo_ausencia');
             
