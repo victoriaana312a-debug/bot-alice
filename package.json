@@ -1,0 +1,15 @@
+{
+  "name": "bot-alice",
+  "version": "1.0.0",
+  "description": "Bot completo da Bot Alice",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.11.0",
+    "@discordjs/voice": "^0.16.1",
+    "discord.js": "^14.14.1",
+    "play-dl": "^1.9.7"
+  }
+}
