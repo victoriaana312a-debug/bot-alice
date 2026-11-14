@@ -2,11 +2,13 @@ const {
     Client, GatewayIntentBits, Partials, 
     ActionRowBuilder, ButtonBuilder, ButtonStyle, 
     EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, 
-    ChannelType, PermissionFlagsBits, StringSelectMenuBuilder, StringSelectMenuOptionBuilder 
+    ChannelType, PermissionFlagsBits, StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
+    AttachmentBuilder 
 } = require('discord.js');
 const { 
     joinVoiceChannel, createAudioPlayer, createAudioResource,
-    entersState, VoiceConnectionStatus, AudioPlayerStatus, getVoiceConnection 
+    entersState, VoiceConnectionStatus, AudioPlayerStatus, getVoiceConnection,
+    generateDependencyReport 
 } = require('@discordjs/voice');
 const playdl = require('play-dl');
 
@@ -26,8 +28,9 @@ const client = new Client({
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_AVISOS = '1412972674107310191';
 const CHANNEL_LIVES = '1447400943061700759';
-const CATEGORIA_TICKETS = '1447402685933334548';
-const CHANNEL_LOGS_REGISTROS = '1570976488541528114';
+const CATEGORIA_TICKETS = '1412972614694998097';
+const CHANNEL_LOGS_REGISTROS = '1570976488541528114'; // logs do set/registro
+const CHANNEL_LOGS_TICKETS = '1571032220058128394'; // logs de tickets finalizados
 const CHANNEL_WELCOME = '1412972674107310191'; // Ajuste o ID se preferir outro canal para entrada/saída
 
 // IDs DE CARGOS DO SET
@@ -43,6 +46,7 @@ const CARGOS = {
 
 client.once('ready', () => {
     console.log(`Bot online como ${client.user.tag}!`);
+    console.log(generateDependencyReport()); // mostra o que falta para o áudio funcionar
 });
 
 // ==========================================
@@ -104,6 +108,9 @@ client.on('messageCreate', async message => {
             selfDeaf: true
         });
 
+        connection.on('stateChange', (antigo, novo) => console.log(`[voz] ${antigo.status} -> ${novo.status}`));
+        connection.on('error', err => console.error('[voz] erro na conexão:', err));
+
         try {
             // Espera a conexão de voz ficar pronta antes de tocar
             await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
@@ -119,10 +126,13 @@ client.on('messageCreate', async message => {
                 url = results[0].url;
             }
 
+            console.log('[música] buscando stream de:', url);
             const streamData = await playdl.stream(url);
+            console.log('[música] stream obtido, tipo:', streamData.type);
             const resource = createAudioResource(streamData.stream, { inputType: streamData.type });
             const player = createAudioPlayer();
 
+            player.on('stateChange', (antigo, novo) => console.log(`[player] ${antigo.status} -> ${novo.status}`));
             player.on('error', err => {
                 console.error('Erro no player:', err);
                 message.channel.send('❌ Erro durante a reprodução.');
@@ -140,7 +150,7 @@ client.on('messageCreate', async message => {
         } catch (error) {
             console.error('Erro detalhado no player:', error);
             connection.destroy();
-            message.reply('❌ Ocorreu um erro ao tentar reproduzir esta música.');
+            message.reply(`❌ Erro ao reproduzir: \`${String(error.message).slice(0, 200)}\``);
         }
     }
 
@@ -154,6 +164,73 @@ client.on('messageCreate', async message => {
         }
     }
 });
+
+// ==========================================
+// SORTEIOS (estado em memória + funções auxiliares)
+// ==========================================
+// Obs.: os sorteios ficam na memória do bot. Se o bot reiniciar, sorteios em andamento são perdidos.
+const sorteios = new Map(); // idDaMensagem -> { messageId, channelId, guildId, premio, participantes:Set, status, vencedorId }
+
+function embedSorteio(sorteio) {
+    const total = sorteio.participantes.size;
+
+    if (sorteio.status === 'pausado') {
+        return new EmbedBuilder()
+            .setTitle('⏸️ SORTEIO PAUSADO')
+            .setDescription(`Prêmio: **${sorteio.premio}**\n\nAs participações estão pausadas no momento. Aguarde a staff retomar!`)
+            .setColor(0x95A5A6)
+            .setFooter({ text: `Participantes: ${total}` })
+            .setTimestamp();
+    }
+
+    if (sorteio.status === 'finalizado') {
+        const resultado = sorteio.vencedorId
+            ? `🏆 Vencedor(a): <@${sorteio.vencedorId}>`
+            : 'Nenhum participante neste sorteio.';
+        return new EmbedBuilder()
+            .setTitle('🏁 SORTEIO FINALIZADO')
+            .setDescription(`Prêmio: **${sorteio.premio}**\n\n${resultado}`)
+            .setColor(0xE74C3C)
+            .setFooter({ text: `Participantes: ${total}` })
+            .setTimestamp();
+    }
+
+    return new EmbedBuilder()
+        .setTitle('🎉 NOVO SORTEIO!')
+        .setDescription(`Prêmio: **${sorteio.premio}**\n\nClique no botão 🎉 abaixo para garantir a sua participação!`)
+        .setColor(0x9B59B6)
+        .setFooter({ text: `Participantes: ${total}` })
+        .setTimestamp();
+}
+
+function botaoSorteio(sorteio) {
+    const ativo = sorteio.status === 'ativo';
+    const label = ativo ? 'Participar' : (sorteio.status === 'pausado' ? 'Pausado' : 'Encerrado');
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('btn_participar_sorteio')
+            .setLabel(label)
+            .setStyle(ativo ? ButtonStyle.Success : ButtonStyle.Secondary)
+            .setEmoji('🎉')
+            .setDisabled(!ativo)
+    );
+}
+
+async function atualizarMensagemSorteio(sorteio) {
+    const canal = await client.channels.fetch(sorteio.channelId);
+    const msg = await canal.messages.fetch(sorteio.messageId);
+    await msg.edit({ embeds: [embedSorteio(sorteio)], components: [botaoSorteio(sorteio)] });
+}
+
+// Acha o sorteio pelo ID da mensagem; sem ID, pega o mais recente do servidor que atenda ao filtro
+function buscarSorteio(guildId, idMensagem, filtro) {
+    if (idMensagem) {
+        const encontrado = sorteios.get(idMensagem);
+        return encontrado && encontrado.guildId === guildId ? encontrado : null;
+    }
+    const candidatos = [...sorteios.values()].filter(x => x.guildId === guildId && filtro(x));
+    return candidatos.length ? candidatos[candidatos.length - 1] : null;
+}
 
 // ==========================================
 // 3. COMANDOS DE CRIAÇÃO DE PAINÉIS
@@ -242,26 +319,105 @@ client.on('messageCreate', async message => {
         await message.reply('✅ Painel de sugestões enviado com sucesso!');
     }
 
-    // 🎉 PAINEL DE SORTEIOS
+    // 🎉 CRIAR SORTEIO: !sorteio <prêmio>
     if (message.content.startsWith('!sorteio ')) {
         if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return message.reply('❌ Você não tem permissão.');
         }
 
-        const premio = message.content.slice(9);
+        const premio = message.content.slice(9).trim();
+        if (!premio) return message.reply('❌ Informe o prêmio. Ex: `!sorteio Nitro`');
 
-        const embed = new EmbedBuilder()
-            .setTitle('🎉 NOVO SORTEIO!')
-            .setDescription(`Prêmio: **${premio}**\n\nClique no botão 🎉 abaixo para garantir a sua participação!`)
-            .setColor(0x9B59B6)
-            .setTimestamp();
+        const sorteio = {
+            messageId: null,
+            channelId: message.channel.id,
+            guildId: message.guild.id,
+            premio,
+            participantes: new Set(),
+            status: 'ativo',
+            vencedorId: null
+        };
 
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('btn_participar_sorteio').setLabel('Participar').setStyle(ButtonStyle.Success).setEmoji('🎉')
-        );
+        const enviada = await message.channel.send({
+            content: '@everyone',
+            embeds: [embedSorteio(sorteio)],
+            components: [botaoSorteio(sorteio)]
+        });
 
-        await message.channel.send({ embeds: [embed], components: [row] });
-        await message.delete();
+        sorteio.messageId = enviada.id;
+        sorteios.set(enviada.id, sorteio);
+
+        await message.delete().catch(() => {});
+    }
+
+    // ⏸️ PAUSAR SORTEIO: !pausar-sorteio [idDaMensagem]
+    if (message.content.startsWith('!pausar-sorteio')) {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return message.reply('❌ Você não tem permissão.');
+        }
+
+        const idArg = message.content.split(/ +/)[1];
+        const sorteio = buscarSorteio(message.guild.id, idArg, x => x.status === 'ativo');
+        if (!sorteio) return message.reply('❌ Não encontrei nenhum sorteio ativo para pausar.');
+        if (sorteio.status !== 'ativo') return message.reply('❌ Esse sorteio não está ativo.');
+
+        sorteio.status = 'pausado';
+        try {
+            await atualizarMensagemSorteio(sorteio);
+            message.reply(`⏸️ Sorteio de **${sorteio.premio}** pausado. Use \`!retomar-sorteio\` para continuar.`);
+        } catch (error) {
+            console.error('Erro ao pausar sorteio:', error);
+            message.reply('❌ Não consegui atualizar a mensagem do sorteio (ela ainda existe?).');
+        }
+    }
+
+    // ▶️ RETOMAR SORTEIO: !retomar-sorteio [idDaMensagem]
+    if (message.content.startsWith('!retomar-sorteio')) {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return message.reply('❌ Você não tem permissão.');
+        }
+
+        const idArg = message.content.split(/ +/)[1];
+        const sorteio = buscarSorteio(message.guild.id, idArg, x => x.status === 'pausado');
+        if (!sorteio) return message.reply('❌ Não encontrei nenhum sorteio pausado para retomar.');
+        if (sorteio.status !== 'pausado') return message.reply('❌ Esse sorteio não está pausado.');
+
+        sorteio.status = 'ativo';
+        try {
+            await atualizarMensagemSorteio(sorteio);
+            message.reply(`▶️ Sorteio de **${sorteio.premio}** retomado!`);
+        } catch (error) {
+            console.error('Erro ao retomar sorteio:', error);
+            message.reply('❌ Não consegui atualizar a mensagem do sorteio (ela ainda existe?).');
+        }
+    }
+
+    // 🏁 FINALIZAR SORTEIO: !finalizar-sorteio [idDaMensagem]
+    if (message.content.startsWith('!finalizar-sorteio')) {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return message.reply('❌ Você não tem permissão.');
+        }
+
+        const idArg = message.content.split(/ +/)[1];
+        const sorteio = buscarSorteio(message.guild.id, idArg, x => x.status !== 'finalizado');
+        if (!sorteio) return message.reply('❌ Não encontrei nenhum sorteio em andamento para finalizar.');
+        if (sorteio.status === 'finalizado') return message.reply('❌ Esse sorteio já foi finalizado.');
+
+        const lista = [...sorteio.participantes];
+        sorteio.status = 'finalizado';
+        sorteio.vencedorId = lista.length ? lista[Math.floor(Math.random() * lista.length)] : null;
+
+        try {
+            await atualizarMensagemSorteio(sorteio);
+        } catch (error) {
+            console.error('Erro ao atualizar mensagem do sorteio:', error);
+        }
+
+        if (sorteio.vencedorId) {
+            await message.channel.send(`🎉 Parabéns <@${sorteio.vencedorId}>! Você ganhou o sorteio de **${sorteio.premio}**!`);
+        } else {
+            await message.channel.send(`😕 O sorteio de **${sorteio.premio}** foi finalizado sem participantes.`);
+        }
     }
 });
 
@@ -271,39 +427,100 @@ client.on('messageCreate', async message => {
 client.on('interactionCreate', async interaction => {
     // Gestão de Tickets por Select Menu
     if (interaction.isStringSelectMenu() && interaction.customId === 'menu_ticket') {
-        const tipo = interaction.values[0];
-        const guild = interaction.guild;
-        const member = interaction.member;
-        const nomeCanal = tipo === 'duvida' ? `duvida-${member.user.username}` : `denuncia-${member.user.username}`;
+        // Responde imediatamente (o Discord só espera 3 segundos)
+        await interaction.deferReply({ ephemeral: true });
 
-        const channel = await guild.channels.create({
-            name: nomeCanal,
-            type: ChannelType.GuildText,
-            parent: CATEGORIA_TICKETS,
-            permissionOverwrites: [
-                { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: member.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-                { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] }
-            ],
-        });
+        try {
+            const tipo = interaction.values[0];
+            const guild = interaction.guild;
+            const member = interaction.member;
+            const nomeCanal = tipo === 'duvida' ? `duvida-${member.user.username}` : `denuncia-${member.user.username}`;
 
-        const embed = new EmbedBuilder()
-            .setTitle(`Ticket de ${tipo === 'duvida' ? 'Dúvida' : 'Denúncia'} - ${member.user.username}`)
-            .setDescription('Descreva detalhadamente o seu caso. A staff responderá em breve.')
-            .setColor(tipo === 'duvida' ? 0x3498DB : 0xE74C3C);
+            const channel = await guild.channels.create({
+                name: nomeCanal,
+                type: ChannelType.GuildText,
+                parent: CATEGORIA_TICKETS,
+                topic: `ticket:${tipo}:${member.id}`, // guarda tipo e dono do ticket para o log
+                permissionOverwrites: [
+                    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+                    { id: member.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+                    { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] }
+                ],
+            });
 
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('fechar_ticket').setLabel('Fechar Ticket').setStyle(ButtonStyle.Danger)
-        );
+            const embed = new EmbedBuilder()
+                .setTitle(`Ticket de ${tipo === 'duvida' ? 'Dúvida' : 'Denúncia'} - ${member.user.username}`)
+                .setDescription('Descreva detalhadamente o seu caso. A staff responderá em breve.')
+                .setColor(tipo === 'duvida' ? 0x3498DB : 0xE74C3C);
 
-        await channel.send({ content: `<@${member.id}>`, embeds: [embed], components: [row] });
-        await interaction.reply({ content: `✅ Seu ticket foi aberto em ${channel}!`, ephemeral: true });
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('fechar_ticket').setLabel('Fechar Ticket').setStyle(ButtonStyle.Danger)
+            );
+
+            await channel.send({ content: `<@${member.id}>`, embeds: [embed], components: [row] });
+            await interaction.editReply({ content: `✅ Seu ticket foi aberto em ${channel}!` });
+        } catch (error) {
+            console.error('Erro ao criar ticket:', error);
+            await interaction.editReply({ content: '❌ Não consegui criar o ticket. Avise a staff.' }).catch(() => {});
+        }
     }
 
-    // Fechar Ticket
+    // Fechar Ticket (salva o log no canal de logs antes de apagar)
     if (interaction.isButton() && interaction.customId === 'fechar_ticket') {
         const channel = interaction.channel;
-        await interaction.reply('🔒 Fechando o ticket em 5 segundos...');
+        await interaction.reply('🔒 Salvando o log e fechando o ticket em 5 segundos...');
+
+        try {
+            // Busca todas as mensagens do canal (até 1000)
+            let todas = [];
+            let ultimoId;
+            while (todas.length < 1000) {
+                const lote = await channel.messages.fetch({ limit: 100, ...(ultimoId && { before: ultimoId }) });
+                if (lote.size === 0) break;
+                todas.push(...lote.values());
+                ultimoId = lote.last().id;
+            }
+            todas.reverse(); // da mais antiga para a mais nova
+
+            const formatarData = d => d.toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+            const linhas = todas.map(m => {
+                let texto = m.content || '';
+                if (m.embeds.length) texto += ` [embed: ${m.embeds.map(e => e.title || 'sem título').join(', ')}]`;
+                if (m.attachments.size) texto += ` [anexos: ${m.attachments.map(a => a.url).join(', ')}]`;
+                return `[${formatarData(m.createdAt)}] ${m.author.tag}: ${texto}`;
+            });
+
+            const [, tipo, donoId] = (channel.topic || '').split(':');
+            const tipoNome = tipo === 'denuncia' ? 'Denúncia' : 'Dúvida';
+
+            const arquivo = new AttachmentBuilder(
+                Buffer.from(linhas.join('\n') || 'Sem mensagens.', 'utf-8'),
+                { name: `${channel.name}.txt` }
+            );
+
+            const embedLog = new EmbedBuilder()
+                .setTitle('🎫 Ticket Finalizado')
+                .addFields(
+                    { name: 'Tipo', value: tipoNome || 'Desconhecido', inline: true },
+                    { name: 'Canal', value: channel.name, inline: true },
+                    { name: 'Aberto por', value: donoId ? `<@${donoId}>` : 'Desconhecido', inline: false },
+                    { name: 'Fechado por', value: `${interaction.user} (${interaction.user.tag})`, inline: false },
+                    { name: 'Mensagens', value: String(todas.length), inline: true }
+                )
+                .setColor(0xE67E22)
+                .setTimestamp();
+
+            const logsChannel = interaction.guild.channels.cache.get(CHANNEL_LOGS_TICKETS);
+            if (logsChannel) {
+                await logsChannel.send({ embeds: [embedLog], files: [arquivo] });
+            } else {
+                console.error('Canal de logs de tickets não encontrado:', CHANNEL_LOGS_TICKETS);
+            }
+        } catch (error) {
+            console.error('Erro ao salvar log do ticket:', error);
+        }
+
         setTimeout(() => { channel.delete().catch(() => {}); }, 5000);
     }
 
@@ -360,7 +577,24 @@ client.on('interactionCreate', async interaction => {
 
     // Participar de Sorteio
     if (interaction.isButton() && interaction.customId === 'btn_participar_sorteio') {
+        const sorteio = sorteios.get(interaction.message.id);
+
+        if (!sorteio) {
+            return interaction.reply({ content: '❌ Este sorteio não está mais ativo (o bot foi reiniciado). Peça para a staff criar outro.', ephemeral: true });
+        }
+        if (sorteio.status === 'pausado') {
+            return interaction.reply({ content: '⏸️ Este sorteio está pausado no momento.', ephemeral: true });
+        }
+        if (sorteio.status === 'finalizado') {
+            return interaction.reply({ content: '🏁 Este sorteio já foi finalizado.', ephemeral: true });
+        }
+        if (sorteio.participantes.has(interaction.user.id)) {
+            return interaction.reply({ content: '✅ Você já está participando deste sorteio!', ephemeral: true });
+        }
+
+        sorteio.participantes.add(interaction.user.id);
         await interaction.reply({ content: '🎉 Presença garantida! Boa sorte no sorteio!', ephemeral: true });
+        interaction.message.edit({ embeds: [embedSorteio(sorteio)] }).catch(() => {}); // atualiza o contador
     }
 });
 
@@ -472,5 +706,8 @@ client.on('messageCreate', async message => {
         await canal.send({ content: '@everyone 🔴 **LIVE ON!**', embeds: [embed], components: [row] });
     }
 });
+
+process.on('unhandledRejection', err => console.error('Erro não tratado:', err));
+process.on('uncaughtException', err => console.error('Exceção não tratada:', err));
 
 client.login(TOKEN);
